@@ -16,6 +16,7 @@
 
 import torch
 import torch.nn as nn 
+from torch.nn import functional as F
 
 from itertools import repeat
 import collections.abc
@@ -101,12 +102,42 @@ class Attention(nn.Module):
         if self.rope is not None:
             q = self.rope(q, xpos)
             k = self.rope(k, xpos)
-               
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # attn = (q @ k.transpose(-2, -1)) * self.scale
+        # attn = attn.softmax(dim=-1)
+        # attn = self.attn_drop(attn)
+        # x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        # x = xops.memory_efficient_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), p=self.attn_drop.p).reshape(B, N, C)
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p).transpose(1, 2).reshape(B, N, C) 
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+class LinearAttention(nn.Module):
+    def __init__(self, dim, rope=None, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.5):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.rope = rope 
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+    def forward(self, x, xpos):
+        B, N, C = x.shape
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1,3)
+        q, k, v = [qkv[:,:,i] for i in range(3)]
+        if self.rope is not None:
+            q = self.rope(q, xpos)
+            k = self.rope(k, xpos)
+
+        # Linear attention approximation: process k and v first
+        kv = torch.einsum('bhnd,bhne->bhde', k, v)  # (B, num_heads, d, e)
+        qk = torch.einsum('bhnd,bhde->bhne', q, kv)
+
+        x = qk.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -154,16 +185,53 @@ class CrossAttention(nn.Module):
         q = self.projq(query).reshape(B,Nq,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
         k = self.projk(key).reshape(B,Nk,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
         v = self.projv(value).reshape(B,Nv,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
-        
         if self.rope is not None:
             q = self.rope(q, qpos)
             k = self.rope(k, kpos)
             
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # attn = (q @ k.transpose(-2, -1)) * self.scale
+        # attn = attn.softmax(dim=-1)
+        # attn = self.attn_drop(attn)
+        # x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)
+        # x = xops.memory_efficient_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), p=self.attn_drop.p).reshape(B, Nq, C)
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p).transpose(1, 2).reshape(B, Nq, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+class LinearCrossAttention(nn.Module):
+    
+    def __init__(self, dim, rope=None, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.5):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
 
-        x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)
+        self.projq = nn.Linear(dim, dim, bias=qkv_bias)
+        self.projk = nn.Linear(dim, dim, bias=qkv_bias)
+        self.projv = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.rope = rope
+        
+    def forward(self, query, key, value, qpos, kpos):
+        B, Nq, C = query.shape
+        Nk = key.shape[1]
+        Nv = value.shape[1]
+        
+        q = self.projq(query).reshape(B,Nq,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        k = self.projk(key).reshape(B,Nk,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        v = self.projv(value).reshape(B,Nv,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        if self.rope is not None:
+            q = self.rope(q, qpos)
+            k = self.rope(k, kpos)
+        # Linear attention approximation: process k and v first
+        kv = torch.einsum('bhnd,bhne->bhde', k, v)  # (B, num_heads, d, e)
+        qk = torch.einsum('bhnd,bhde->bhne', q, kv)
+
+        x = qk.transpose(1, 2).reshape(B, Nq, C)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
